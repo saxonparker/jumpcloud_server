@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/json"
@@ -46,8 +47,21 @@ type HashServer struct {
 	hashedMux       sync.Mutex
 
 	// Shutdown bool to indicate if the server has been shutdown
-	shutdown    bool
-	shutdownMux sync.Mutex
+	shutdown bool
+	// This RWLock is locked as a reader by all normal request handlers, and held as a writer by the shutdown
+	// request handler. It is done this way to prevent a shutdown from occurring while a POST request is outstanding.
+	// The shutdown handler will close the hashRequests channel, so if a POST handler tried to write after that,
+	// the program would crash. Using an RWLock like this prevents the shutdown from being able to close the channel
+	// while POSTs are outstanding.
+	shutdownRW sync.RWMutex
+
+	// HTTP Server
+	server    http.Server
+	serverMux *http.ServeMux
+
+	// Channels for signalling completion
+	workerDone   chan struct{}
+	shutdownDone chan struct{}
 }
 
 func NewHashServer(port uint, hashDelay time.Duration, chanSize uint64) *HashServer {
@@ -59,6 +73,10 @@ func NewHashServer(port uint, hashDelay time.Duration, chanSize uint64) *HashSer
 	p.hashRequests = make(chan *passwordRequest, chanSize)
 	p.hashedPasswords = make(map[uint64]string)
 	p.shutdown = false
+	p.serverMux = http.NewServeMux()
+	p.server = http.Server{Addr: fmt.Sprintf(":%d", p.port), Handler: p.serverMux}
+	p.workerDone = make(chan struct{})
+	p.shutdownDone = make(chan struct{})
 	return p
 }
 
@@ -75,23 +93,33 @@ func (hs *HashServer) hashWorker() {
 		// Perform the hash
 		hasher.Write([]byte(req.Password))
 		hashed := hasher.Sum(nil)
-		base := base64.URLEncoding.EncodeToString(hashed)
+		base := base64.StdEncoding.EncodeToString(hashed)
 
 		// Update the map
 		hs.hashedMux.Lock()
 		hs.hashedPasswords[req.ID] = base
 		hs.hashedMux.Unlock()
 	}
+
+	close(hs.workerDone)
 }
 
 func (hs *HashServer) hashGetHandler(w http.ResponseWriter, r *http.Request) {
+	// Grab the read lock so we don't shut down while performing this operation
+	hs.shutdownRW.RLock()
+	defer hs.shutdownRW.RUnlock()
+
+	if hs.shutdown {
+		http.Error(w, "Server shut down", http.StatusMethodNotAllowed)
+	}
+
 	switch r.Method {
 	case "GET":
 		// Parse the requested ID
 		reqID := r.URL.Path[len("/hash/"):]
 		id, err := strconv.ParseUint(reqID, 0, 64)
 		if err != nil {
-			fmt.Fprintf(w, "Expected request id to be an integer, but got '%s'\n", reqID)
+			http.Error(w, fmt.Sprintf("Expected request id to be an integer, but got '%s'\n", reqID), http.StatusBadRequest)
 			return
 		}
 
@@ -109,18 +137,27 @@ func (hs *HashServer) hashGetHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (hs *HashServer) hashPostHandler(w http.ResponseWriter, r *http.Request) {
+	// Grab the read lock so we don't shut down while performing the POST
+	hs.shutdownRW.RLock()
+	defer hs.shutdownRW.RUnlock()
+
+	if hs.shutdown {
+		http.Error(w, "Server shut down", http.StatusMethodNotAllowed)
+	}
+
 	switch r.Method {
 	case "POST":
 		timeStart := time.Now()
 
 		// Parse the request
 		if err := r.ParseForm(); err != nil {
-			fmt.Fprintf(w, "Could not parse request. Error: %v\n", err)
+			http.Error(w, fmt.Sprintf("Could not parse request. Error: %v\n", err), http.StatusBadRequest)
 			return
 		}
+
 		password := r.FormValue("password")
 		if password == "" {
-			fmt.Fprintf(w, "'password' not provided in form. Nothing to hash.")
+			http.Error(w, fmt.Sprintf("'password' not provided in form. Nothing to hash."), http.StatusBadRequest)
 			return
 		}
 
@@ -157,6 +194,14 @@ type stats struct {
 
 // Handles requests to the /stats endpoint
 func (hs *HashServer) statsHandler(w http.ResponseWriter, r *http.Request) {
+	// Grab the read lock so we don't shut down while performing this operation
+	hs.shutdownRW.RLock()
+	defer hs.shutdownRW.RUnlock()
+
+	if hs.shutdown {
+		http.Error(w, "Server shut down", http.StatusMethodNotAllowed)
+	}
+
 	switch r.Method {
 	case "GET":
 		// Gather the fields under the lock. We'll do the JSON marshalling outside the lock
@@ -180,10 +225,47 @@ func (hs *HashServer) statsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (hs *HashServer) shutdownHandler(w http.ResponseWriter, r *http.Request) {
+	// Grab the write lock here. Because we're going to close the request channel, we have to be sure that there
+	// are no POST requests currently going, otherwise a POST request could write to a closed channel, which would
+	// panic.
+	hs.shutdownRW.Lock()
+	defer hs.shutdownRW.Unlock()
+
+	// Only the first call to shutdown should close the channel
+	if !hs.shutdown {
+		hs.shutdown = true
+
+		// Close the channel to the hash worker, so it knows to stop when it's processed all outstanding requests
+		close(hs.hashRequests)
+
+		// Shut down the HTTP server
+		go func() {
+			hs.server.Shutdown(context.Background())
+			close(hs.shutdownDone)
+		}()
+	}
+}
+
 func (hs *HashServer) Run() {
+
+	// Start up has worker
 	go hs.hashWorker()
-	http.HandleFunc("/hash", hs.hashPostHandler)
-	http.HandleFunc("/hash/", hs.hashGetHandler)
-	http.HandleFunc("/stats", hs.statsHandler)
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", hs.port), nil))
+
+	// Add handlers
+	hs.serverMux.HandleFunc("/hash", hs.hashPostHandler)
+	hs.serverMux.HandleFunc("/hash/", hs.hashGetHandler)
+	hs.serverMux.HandleFunc("/stats", hs.statsHandler)
+	hs.serverMux.HandleFunc("/shutdown", hs.shutdownHandler)
+
+	// Launch the server
+	go func() {
+		if err := hs.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+
+	// Wait for all work to complete before exiting
+	<-hs.shutdownDone
+	<-hs.workerDone
 }
