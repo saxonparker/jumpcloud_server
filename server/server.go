@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+// Helper struct for passing requests from the POST handler to the hash worker. Includes the password to hash, the id
+// of that password, and the time to hash it.
 type passwordRequest struct {
 	Password   string
 	ID         uint64
@@ -24,6 +26,11 @@ func newPasswordRequest(password string, id uint64, delay time.Duration) *passwo
 	return p
 }
 
+// HashServer is an HTTP server for hashing passwords. It provides the following endpoints
+//  - /hash - POST a new password to hash
+//  - /hash/<id> - GET a hashed password
+//  - /stats - GET stats on hashed passwords
+//  - /shutdown - Shuts down the server
 type HashServer struct {
 	// Port to listen on
 	port uint
@@ -64,6 +71,10 @@ type HashServer struct {
 	shutdownDone chan struct{}
 }
 
+// NewHashServer creates a new HashServer with the following args:
+//  - port: The port to listen on
+//  - hashDelay: How long to delay hashing a password
+//  - chanSize: The size of the channel of outstanding hash requests. This limits the number of outstanding requests
 func NewHashServer(port uint, hashDelay time.Duration, chanSize uint64) *HashServer {
 	p := new(HashServer)
 	p.port = port
@@ -248,6 +259,7 @@ func (hs *HashServer) shutdownHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Run runs the HashServer. It will block until a request is made to /shutdown
 func (hs *HashServer) Run() {
 
 	// Start up has worker
