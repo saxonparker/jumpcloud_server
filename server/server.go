@@ -91,6 +91,8 @@ func NewHashServer(port uint, hashDelay time.Duration, chanSize uint64) *HashSer
 	return p
 }
 
+// The hashWorker function is meant to be run as a goroutine. It receives password requests on the hashRequests channel
+// and performs the hash at the right time.
 func (hs *HashServer) hashWorker() {
 	hasher := sha512.New()
 
@@ -116,6 +118,7 @@ func (hs *HashServer) hashWorker() {
 	close(hs.workerDone)
 }
 
+// Handler for /hash/<ID>
 func (hs *HashServer) hashGetHandler(w http.ResponseWriter, r *http.Request) {
 	// Grab the read lock so we don't shut down while performing this operation
 	hs.shutdownRW.RLock()
@@ -148,6 +151,7 @@ func (hs *HashServer) hashGetHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Handler for POST requests to /hash
 func (hs *HashServer) hashPostHandler(w http.ResponseWriter, r *http.Request) {
 	// Grab the read lock so we don't shut down while performing the POST
 	hs.shutdownRW.RLock()
@@ -237,6 +241,7 @@ func (hs *HashServer) statsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Handles requests to the /shutdown endpoint
 func (hs *HashServer) shutdownHandler(w http.ResponseWriter, r *http.Request) {
 	// Grab the write lock here. Because we're going to close the request channel, we have to be sure that there
 	// are no POST requests currently going, otherwise a POST request could write to a closed channel, which would
