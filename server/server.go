@@ -262,7 +262,7 @@ func (hs *HashServer) shutdownHandler(w http.ResponseWriter, r *http.Request) {
 // Run runs the HashServer. It will block until a request is made to /shutdown
 func (hs *HashServer) Run() {
 
-	// Start up has worker
+	// Start up hash worker
 	go hs.hashWorker()
 
 	// Add handlers
