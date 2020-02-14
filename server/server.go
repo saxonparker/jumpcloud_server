@@ -91,6 +91,7 @@ func (hs *HashServer) hashWorker() {
 		time.Sleep(req.TimeToHash.Sub(time.Now()))
 
 		// Perform the hash
+		hasher.Reset()
 		hasher.Write([]byte(req.Password))
 		hashed := hasher.Sum(nil)
 		base := base64.StdEncoding.EncodeToString(hashed)
